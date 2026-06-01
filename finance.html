@@ -283,6 +283,20 @@ html, body { scrollbar-width: none; -ms-overflow-style: none; }
   flex-shrink: 0;
 }
 
+.nw-ticker-badge {
+  font-family: var(--font-mono);
+  font-size: 10px; font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+  background: rgba(110,231,183,0.08);
+  border: 1px solid rgba(110,231,183,0.18);
+  border-radius: 6px;
+  padding: 2px 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: default;
+}
+
 /* Quick-add composer */
 .quick-add {
   display: flex;
@@ -1699,11 +1713,14 @@ input[type="date"]::-webkit-calendar-picker-indicator {
       <div class="card nw-subcard">
         <div class="label" style="display:flex;justify-content:space-between;align-items:center"><span>📈 Stocks / Investments</span><span id="stocksTotal" style="font-size:13px;color:var(--text-primary);font-weight:600">0</span></div>
         <div id="stocksList" class="nw-list"></div>
-        <div class="quick-add">
-          <input type="text" placeholder="Stock / fund" id="stocksName" />
-          <input type="number" placeholder="Value" id="stocksAmount" step="0.01" />
+        <div class="quick-add" style="flex-wrap:wrap">
+          <input type="text" placeholder="Name (e.g. Apple)" id="stocksName" style="flex:2;min-width:100px" />
+          <input type="text" placeholder="Ticker (AAPL)" id="stocksTicker" style="flex:1;min-width:70px;max-width:90px" autocomplete="off" />
+          <input type="number" placeholder="Shares" id="stocksShares" step="any" style="flex:1;min-width:70px;max-width:90px" />
+          <input type="number" placeholder="Manual value" id="stocksAmount" step="0.01" style="flex:1;min-width:90px" />
           <button class="quick-add-btn" id="stocksAddBtn">+</button>
         </div>
+        <div id="stocksPriceStatus" style="font-size:11px;color:var(--text-tertiary);margin-top:4px;min-height:14px;padding:0 4px"></div>
       </div>
       <!-- Crypto -->
       <div class="card nw-subcard">
@@ -1973,6 +1990,83 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   }
   loadExchangeRates();
 
+  // ---- Live stock price fetching (Yahoo Finance) ----
+  async function fetchStockPrices() {
+    const items = storeGet('nw:stocks') || [];
+    const tickers = [...new Set(items.filter(i => i.ticker && i.shares).map(i => i.ticker))];
+    if (!tickers.length) return;
+    const statusEl = document.getElementById('stocksPriceStatus');
+    if (statusEl) statusEl.textContent = 'Refreshing prices…';
+    let updated = false;
+    for (const ticker of tickers) {
+      try {
+        const res = await fetch(
+          'https://query1.finance.yahoo.com/v8/finance/chart/' + ticker + '?interval=1d&range=1d',
+          { cache: 'no-store' }
+        );
+        if (!res.ok) continue;
+        const data = await res.json();
+        const meta = data.chart && data.chart.result && data.chart.result[0] && data.chart.result[0].meta;
+        if (!meta || !meta.regularMarketPrice) continue;
+        const price = meta.regularMarketPrice;
+        const priceCurrency = meta.currency || 'USD';
+        const rate = exchangeRates[priceCurrency] || 1;
+        const priceInCHF = price / rate;
+        items.forEach(item => {
+          if (item.ticker !== ticker) return;
+          item.lastPrice = price;
+          item.priceCurrency = priceCurrency;
+          item.priceAt = Date.now();
+          item.amount = priceInCHF * (Number(item.shares) || 0);
+        });
+        updated = true;
+      } catch (e) {}
+    }
+    if (updated) {
+      storeSet('nw:stocks', items);
+      renderAllNetWorth();
+    }
+    if (statusEl) {
+      if (updated) {
+        const now = new Date();
+        statusEl.textContent = 'Live · updated ' + now.getHours() + ':' + String(now.getMinutes()).padStart(2, '0');
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 15000);
+      } else {
+        statusEl.textContent = '';
+      }
+    }
+  }
+  fetchStockPrices();
+  setInterval(fetchStockPrices, 5 * 60 * 1000);
+
+  function stocksDoAdd() {
+    const nameInput   = document.getElementById('stocksName');
+    const tickerInput = document.getElementById('stocksTicker');
+    const sharesInput = document.getElementById('stocksShares');
+    const amtInput    = document.getElementById('stocksAmount');
+    const ticker  = (tickerInput.value.trim()).toUpperCase();
+    const shares  = parseFloat(sharesInput.value);
+    const manual  = parseFloat(amtInput.value);
+    const dispName = nameInput.value.trim() || ticker;
+    if (!dispName) return;
+    let entry;
+    if (ticker && !isNaN(shares) && shares > 0) {
+      entry = { name: dispName, ticker, shares, amount: 0 };
+    } else if (!isNaN(manual) && manual > 0) {
+      const sym = currencyEl ? currencyEl.value : 'CHF';
+      entry = { name: dispName, amount: manual / (exchangeRates[sym] || 1) };
+    } else {
+      return;
+    }
+    const items = storeGet('nw:stocks') || [];
+    items.push(entry);
+    storeSet('nw:stocks', items);
+    logActivity('stocks', entry.name, entry.amount, 'add');
+    nameInput.value = ''; tickerInput.value = ''; sharesInput.value = ''; amtInput.value = '';
+    renderAllNetWorth();
+    if (entry.ticker) fetchStockPrices();
+  }
+
   function fmtMoney(amountCHF) {
     const symbol = currencyEl ? currencyEl.value : 'CHF';
     const rate = exchangeRates[symbol] || 1;
@@ -2007,7 +2101,18 @@ input[type="date"]::-webkit-calendar-picker-indicator {
         if (removed) logActivity(cat.key, removed.name, -(Number(removed.amount) || 0), 'delete');
         renderAllNetWorth();
       });
-      row.appendChild(name); row.appendChild(amt); row.appendChild(del);
+      row.appendChild(name);
+      if (cat.key === 'stocks' && it.ticker) {
+        const badge = document.createElement('span');
+        badge.className = 'nw-ticker-badge';
+        badge.textContent = it.ticker + (it.shares ? ' × ' + it.shares : '');
+        const ago = it.priceAt ? Math.floor((Date.now() - it.priceAt) / 60000) : null;
+        badge.title = it.lastPrice
+          ? (it.priceCurrency + ' ' + it.lastPrice.toFixed(2) + '/share' + (ago !== null ? ' · ' + ago + 'm ago' : ''))
+          : 'Fetching live price…';
+        row.appendChild(badge);
+      }
+      row.appendChild(amt); row.appendChild(del);
       list.appendChild(row);
     });
     document.getElementById(cat.totalId).textContent = fmtMoney(total);
@@ -2392,6 +2497,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
     const amtInput = document.getElementById(cat.amtId);
     if (!addBtn) return;
     function doAdd() {
+      if (cat.key === 'stocks') { stocksDoAdd(); return; }
       const n = nameInput.value.trim();
       const a = parseFloat(amtInput.value);
       if (!n || isNaN(a)) return;
@@ -2411,6 +2517,10 @@ input[type="date"]::-webkit-calendar-picker-indicator {
     addBtn.addEventListener('click', doAdd);
     nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
     amtInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
+  });
+  ['stocksTicker','stocksShares'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('keydown', (e) => { if (e.key === 'Enter') stocksDoAdd(); });
   });
 
   if (currencyEl) {
